@@ -14,8 +14,6 @@ until redis_ready; do
   sleep 1
 done
 
-echo "!!!!!!!!!!!!!!!!!!!!!Redis is up and running!"
-
 # Load the Lua script into Redis
 cat /usr/local/bin/ermeslib.lua | redis-cli -x FUNCTION LOAD REPLACE
 
