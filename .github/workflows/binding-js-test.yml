@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: packages/go
+        working-directory: packages/js
 
     steps:
       - uses: actions/checkout@v4
