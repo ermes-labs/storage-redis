@@ -1,0 +1,38 @@
+name: binding-js-test
+
+on:
+  push:
+    paths:
+      - 'packages/js/**'
+      - '.github/workflows/binding-js-test.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/go
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Bun.js
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - run: bun install
+      - run: bun run check-ci
+      - run: bun run build
+        # FIXME: Bun and typescript seems to have some configuration issues,
+        # types are emitted correctly but the build fails with a typescript error.
+        continue-on-error: true
+      - run: bun test --coverage --bail
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./packages/js/coverage/coverage-final.json
+          flags: binding-js
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

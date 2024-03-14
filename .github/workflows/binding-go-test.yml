@@ -1,0 +1,40 @@
+name: binding-go-test
+
+on:
+  push:
+    paths:
+      - 'packages/go/**'
+      - '.github/workflows/binding-go-test.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ["1.21.x"]
+    defaults:
+      run:
+        working-directory: packages/go
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ matrix.go-version }}
+      # You can test your matrix by printing the current Go version
+      - name: Display Go version
+        run: go version
+      - name: Install dependencies
+        run: go get .
+      - name: Build
+        run: go build -v ./...
+      - name: Test with the Go CLI and run coverage
+        run: go test ./... -coverprofile=coverage.out -covermode=atomic
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./packages/go/coverage.out
+          flags: binding-go
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
