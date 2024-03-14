@@ -5,295 +5,208 @@ The states of a single session are the following:
     - ONLOADING     : The session is being onloaded from another node.
     - ACTIVE        : The session is active.
     - OFFLOADING    : The session is being offloaded to another node.
-    - OFFLOADED     : The session has been offloaded to another node, it will remain so for a while to allow the node
-                      to notify the offload to the client on the following requests.
+    - OFFLOADED     : The session has been offloaded to another node, it will
+                      remain so for a while to allow the node to notify the
+                      offload to the client on the following request.
+    - DELETING      : The session is being deleted.
 For internal functioning, in each state we track
-    - ReadWriteUses : The number of read-write uses of the session.
-    - ReadOnlyUses  : The number of read-only uses of the session.
-    - used          : If the session is being used or not. We track sessions in ordered sets to know which sessions can
-                      be offloaded (not used) and which is expired to allow garbage collection. Note that a session can
-                      expire while it is being used, it won't be erased until it is not used anymore.
+    - non_offloadable_uses  : The number of usages that do not allow the session to be offloaded.
+    - OffloadableUses       : The number of usages that allow the session to be offloaded.
+
 
 The full state machine is described here:
     ONLOADING: The session is being onloaded from another node.
         - State:
-            - ReadWriteUses : 0,
-            - ReadOnlyUses  : 0,
-            - Used          : true
+            - non_offloadable_uses  : 0,
+            - OffloadableUses       : 0,
         - Transitions:
             (_, _) onload_data   -> ONLOADING (_, _)}.
             (_, _) onload_finish -> ACTIVE    (_, _)}.
+            (_, _) delete        -> DELETING  (_, _)}.
 
     ACTIVE: The session is active
         - State
-            - ReadWriteUses : 0-N,
-            - ReadOnlyUses  : 0-N,
-            - Used          : false if ReadWriteUses == 0 and ReadOnlyUses == 0, true otherwise
+            - non_offloadable_uses  : 0-N,
+            - OffloadableUses       : 0-N,
         - Transitions:
-            (0-N, _  ) rw-acquire   -> ACTIVE     ($++, _  )}.
-            (1-N, _  ) rw-release   -> ACTIVE     ($--, _  )}.
-            (_  , 0-N) ro-acquire   -> ACTIVE     (_  , $++)}.
-            (_  , 1-N) ro-release   -> ACTIVE     (_  , $--)}.
-            (0  , 0-N) offload      -> OFFLOADING (_  , _  )}.
+            (0-N, _  ) acquire              -> ACTIVE     ($++, _  )}.
+            (1-N, _  ) release              -> ACTIVE     ($--, _  )}.
+            (_  , 0-N) acquire-offloadable  -> ACTIVE     (_  , $++)}.
+            (_  , 1-N) release-offloadable  -> ACTIVE     (_  , $--)}.
+            (0  , 0-N) offload              -> OFFLOADING (_  , _  )}.
+            (0  , 0  ) delete               -> DELETING   (_  , _  )}.
 
     OFFLOADING: The session is being offloaded to another node.
         - State
-            - ReadWriteUses : 0,
-            - ReadOnlyUses  : 0-N
-            - Used          : true
+            - non_offloadable_uses  : 0,
+            - OffloadableUses       : 0-N
         - Transitions
-            (_  , 0-N) ro-acquire       -> ACTIVE    (_  , $++)}.
-            (_  , 1-N) ro-release       -> ACTIVE    (_  , $--)}.
-            (_  , _  ) offload-finish   -> OFFLOADED (_  , _  )}.
-            (_  , _  ) offload-cancel   -> ACTIVE    (_  , _  )}. + restore expiration
-      }
+            (_  , 0-N) acquire-offloadable  -> ACTIVE    (_  , $++)}.
+            (_  , 1-N) release-offloadable  -> ACTIVE    (_  , $--)}.
+            (_  , _  ) offload-finish       -> OFFLOADED (_  , _  )}.
+            (_  , _  ) offload-cancel       -> ACTIVE    (_  , _  )}. + restore expiration
 
     OFFLOADED: The session has been offloaded to another node.
         - State
-            - ReadWriteUses : 0,
-            - ReadOnlyUses  : 0-N
-            - Used          : true if ReadOnlyUses > 0, false otherwise
+            - non_offloadable_uses  : 0,
+            - OffloadableUses       : 0-N
         - Transitions
-            (_  , 1-N) ro-release       -> ACTIVE    (_  , $--)}.
+            (_  , 1-N) release-offloadable -> ACTIVE    (_  , $--)}.
 --]]
 
 -- Generate a key in the infrastructure keyspace.
-local function infrastructureKey(key)
+local function infrastructure_key(key)
     return 'i:' .. key
 end
 -- Generate a key in the config keyspace.
-local function configKey(key)
+local function config_key(key)
     return 'c:' .. key
 end
 -- Generate a key in the session keyspace.
-local function sessionDataKey(sessionId, key)
-    -- sessionId must be 36 bytes long
-    if #sessionId ~= 36 then
-        return redis.error_reply('[Ermes]: Session must be 36 bytes long')
-    end
-
-    return 's:' .. sessionId .. ':' .. key
+local function session_data_key(session_id, key)
+    return 's:' .. session_id .. ':' .. key
 end
 -- Generate a key in the session metadata keyspace.
-local function sessionMetadataKey(sessionId)
-    -- sessionId must be 36 bytes long
-    if #sessionId ~= 36 then
-        return redis.error_reply('[Ermes]: Session must be 36 bytes long')
-    end
-
+local function session_metadata_key(session_id)
     --[[
     The session metadata is stored in a hash with the following fields (Note that some properties are like score and
     expiration are stored also in the sorted sets and are kept in sync):
         'state',
-        'rwUses',
-        'roUses',
-        'clientX',
-        'clientY',
-        'offloadedToGateway',
-        'offloadedToSession',
-        '_created_in',
-        '_created_at',
-        '_created_at',
-        '_expires_at',
-        '_updated_at',
-        '_activity_score',
+        'non_offloadable_uses',
+        'offloadable_uses',
+        'client_lat',
+        'client_long',
+        'offloaded_to_host',
+        'offloaded_to_session',
+        'created_in',
+        'created_at',
+        'created_at',
+        'expires_at',
+        'updated_at',
     --]]
-    return 'm:' .. sessionId .. ':data'
+    return 'm:' .. session_id .. ':metadata'
+end
+-- Extract the session id from the session data key.
+local function extract_key_from_session_data_key(session_data_key)
+    local _, _, key = string.find(session_data_key, "s:.-:(.+)")
+    return key
 end
 
--- Ordered set by expiration (or +inf if no expiration is set) of the sessions that are active.
-local usedSessionsSet = configKey('usedSessionsSet')
--- Ordered set by expiration (or +inf if no expiration is set) of the sessions that are not active. Those sessions are
--- eligible for garbage collection.
-local unusedSessionsSet = configKey('unusedSessionsSet')
+-- Ordered set by expiration (or +inf if no expiration is set) of the sessions.
+-- Sessions that are being used have as score the negative of the expiration time.
+-- (or -inf if no expiration is set)
+local sessions_set = config_key('sessions_set')
 -- Ordered set by score of the sessions that can be offloaded.
-local offloadableSessionsSet = configKey('offloadableSessionsSet')
--- Geo set of the nodes that are tracked.
-local trackedNodesGeoSet = configKey('trackedNodesGeoSet')
+local offloadable_sessions_set = config_key('offloadable_sessions_set')
+-- Geo set of the nodes.
+local nodes_geoset = config_key('nodes_geoset')
 -- Key mapped to the id of the current node.
-local currentNodeIdKey = configKey('currentNode')
+local current_node_key = "nil"
 
--- Compute the score of a session. The higher the score, the more the session is 
--- a good candidate for offloading.
-local function update_score(smKey)
-    -- Get the session metadata attributes.
-    local _updated_at, _activity_score = redis.call('HMGET', smKey, '_updated_at', '_activity_score')
-    local currentTime = redis.call('TIME')[1]
-    -- Parse.
-    _updated_at = tonumber(_updated_at)
-    _activity_score = tonumber(_activity_score or 0)
+-- TODO: create a list of errors with codes and messages.
+-- Errors
+local sessionNotFoundError = '1'
+-- ...
 
-    -- Constants.
-    local decay = 0.1
-    local deltaTime = currentTime - _updated_at
-    -- The score starts from the _updated_at field.
-    local _activity_score = currentTime + _activity_score * math.exp(-decay * deltaTime)
-    -- If the session was created in another node.
-    redis.call('HMSET', smKey, '_activity_score', _activity_score)
-
-    -- TODO: Add geo distance to the score.
-    return -_activity_score
-end
-
--- Compute the score of a session. The higher the score, the more the session is 
--- a good candidate for offloading.
-local function compute_score(currentTime, _updated_at, _activity_score)
-    -- Constants.
-    local decay = 0.1
-    local deltaTime = currentTime - _updated_at
-    -- The score starts from the _updated_at field.
-    local _activity_score = currentTime + _activity_score * math.exp(-decay * deltaTime)
-    -- Return the score.
-    return {_activity_score, -_activity_score}
-end
-
--- Function that set the expire time
-local function set_expire_time(sessionId, _expires_at)
-    local smKey = sessionMetadataKey(sessionId)
-    -- Set the session metadata attributes.
-    redis.call('HMSET', smKey,
-            '_expires_at', _expires_at,
-            '_updated_at', redis.call('TIME')[1])
-
-    -- Check if the session is being used or not.
-    if redis.call('ZSCORE', unusedSessionsSet, sessionId) ~= nil then
-        -- Add it to the unusedSessionsSet.
-        redis.call('ZADD', unusedSessionsSet, _expires_at, sessionId)
-    else
-        -- Add it to the usedSessionsSet.
-        redis.call('ZADD', usedSessionsSet, _expires_at, sessionId)
-    end
-
+-- Function that register the current node key.
+redis.register_function('set_current_node_key', function(keys, args)
+    -- Keys.
+    local node_id = keys[1]
+    -- Set the current node key.
+    current_node_key = config_key(node_id)
     -- Return OK.
     return 'OK'
-end
-
-local function delete_session_chunk(sessionId)
-    -- Get the current state.
-    local smKey = sessionMetadataKey(sessionId)
-    local state, rwUses, roUses = redis.call('HMGET', smKey, 'state', 'rwUses', 'roUses')
-
-    -- If session is not deletable, return an error.
-    if rwUses ~= 0 or roUses ~= 0 or state == 'OFFLOADING' or state == 'ONLOADING' then
-        return redis.error_reply('[Ermes]: Session is not deletable')
-    end
-
-    -- TODO: Find the best default value for count. Note that we unpack the 
-    -- result of the scan for performance reasons, and that limits the maximum 
-    -- value of count.
-    local count = 100
-    -- Delete "count" keys that starts with session from the session data.
-    local match = sessionDataKey(sessionId, '*')
-    local result = redis.call('SCAN', 0, 'MATCH', match, 'COUNT', count)
-    -- Unlink the keys.
-    redis.call('UNLINK', unpack(result[2]))
-
-    -- If there are no more keys to delete, delete the session metadata.
-    if result[1] == '0' then
-        -- Delete the session metadata.
-        redis.call('DEL', smKey)
-        -- Remove it from the offloadableSessionsSet.
-        redis.call('ZREM', offloadableSessionsSet, sessionId)
-        -- Remove it from the usedSessionsSet.
-        redis.call('ZREM', usedSessionsSet, sessionId)
-        -- Remove it from the unusedSessionsSet.
-        redis.call('ZREM', unusedSessionsSet, sessionId)
-        -- Return 0 and the number of deleted keys.
-        return {0, #result[2]}
-    end
-
-    -- Otherwise, return 1 and the number of deleted keys (Note that scan may 
-    -- return more keys than count).
-    return {1, #result[2]}
-end
-
--- Function that create a session and acquire it in read-write mode.
-redis.register_function('create_and_rw_acquire', function(keys, args)
-    -- Keys.
-    local sessionId = keys[1]
-    -- Args.
-    local clientX = tonumber(args[1])
-    local clientY = tonumber(args[2])
-    local _expires_at = tonumber(args[3])
-    -- Compute the session metadata key.
-    local smKey = sessionMetadataKey(sessionId)
-    local _created_in = redis.call('GET', currentNodeIdKey)
-
-    -- If session already exists, return an error.
-    if redis.call('EXISTS', smKey) == 1 then
-        return false
-    end
-
-    -- If clientX or clientY are not provided, aproximate them with the
-    -- coordinates of the node that created the session.
-    if clientX == nil or clientY == nil then
-        clientX, clientY = redis.call('GEOPOS', trackedNodesGeoSet, _created_in)[1]
-        clientX = tonumber(clientX)
-        clientY = tonumber(clientY)
-    end
-
-    -- Get the current time.
-    local time = redis.call('TIME')[1]
-    -- Set the session metadata attributes.
-    redis.call('HMSET', smKey,
-            'state', 'ACTIVE',
-            'rwUses', 1,
-            'roUses', 0,
-            'clientX', clientX,
-            'clientY', clientY,
-            '_created_in', _created_in,
-            '_created_at', time,
-            '_updated_at', time,
-            '_expires_at', _expires_at)
-
-    -- Add it to the unusedSessionsSet.
-    redis.call('ZADD', usedSessionsSet, _expires_at or '+inf', sessionId)
-
-    -- Return true.
-    return true
 end)
 
--- Function that create a session and acquire it in read-only mode.
-redis.register_function('create_and_ro_acquire', function(keys, args)
-    -- Keys.
-    local sessionId = keys[1]
-    -- Args.
-    local clientX = tonumber(args[1])
-    local clientY = tonumber(args[2])
-    local _expires_at = tonumber(args[3])
-    -- Compute the session metadata key.
-    local smKey = sessionMetadataKey(sessionId)
-    local _created_in = redis.call('GET', currentNodeIdKey)
+-- Function that return the current node key.
+redis.register_function('get_current_node_key', function(keys, args)
+    return current_node_key
+end)
 
-    -- If session already exists, return an error.
-    if redis.call('EXISTS', smKey) == 1 then
+-- Assert that the id is not empty, otherwise raise an error.
+local function assert_valid_id(id)
+    if id == '' then
+        error('[Ermes]: Id cannot be empty')
+    end
+
+    -- session_id must not contain ":"
+    if string.find(id, ':') then
+        error('[Ermes]: Id cannot contain ":"')
+    end
+end
+
+-- Assert that the geo coordinates are valid, otherwise raise an error.
+local function assert_valid_geo_coordinates(lat, long)
+    local lat, long = tonumber(lat), tonumber(long)
+    -- Check if lat and long are valid.
+    if lat == nil or long == nil or lat < -90 or lat > 90 or long < -180 or long > 180 then
+        error('[Ermes]: Geo coordinates are not valid')
+    end
+end
+
+-- Assert that the string is nil or a valid Unix timestamp, otherwise raise an
+-- error.
+local function assert_valid_timestamp_string_greater_than(string_timestamp, any)
+    if tonumber(string_timestamp) == nil or tonumber(string_timestamp) < (tonumber(any) or 0) then
+        error('[Ermes]: Unix timestamp is not valid')
+    end
+end
+
+-- Function that create a session and acquire it. If a session with the same id
+-- already exists, return false, otherwise return true.
+redis.register_function('create_session', function(keys, args)
+    -- Keys.
+    local session_id = keys[1]
+    -- Args.
+    local client_lat = args[1]
+    local client_long = args[2]
+    local expires_at = args[2]
+    local acquire = args[3] -- "offloadable", "non-offloadable", ""
+    -- Metadata.
+    local metadata_key = session_metadata_key(session_id)
+    -- Get the current time.
+    local time = redis.call('TIME')[1]
+
+    -- Check if the session id is valid.
+    assert_valid_id(session_id)
+    if client_lat ~= "" or client_long ~= "" then
+        -- Check if the client coordinates are valid.
+        assert_valid_geo_coordinates(client_lat, client_long)
+    end
+    if expires_at ~= "" then
+        -- Check if the expires_at is valid.
+        assert_valid_timestamp_string_greater_than(expires_at, time)
+    end
+
+    -- If session already exists, return false.
+    if redis.call('EXISTS', metadata_key) == 1 then
         return false
     end
 
-    -- If clientX or clientY are not provided, aproximate them with the
-    -- coordinates of the node that created the session.
-    if clientX == nil or clientY == nil then
-        clientX, clientY = redis.call('GEOPOS', trackedNodesGeoSet, _created_in)[1]
-        clientX = tonumber(clientX)
-        clientY = tonumber(clientY)
+    -- Set the session metadata attributes.
+    redis.call('HMSET', metadata_key,
+        'state', 'ACTIVE',
+        'non_offloadable_uses', acquire == 'non-offloadable' and '1' or '0',
+        'offloadable_uses', acquire == 'offloadable' and '1' or '0',
+        'client_lat', client_lat,
+        'client_long', client_long,
+        'created_in', current_node_key,
+        'created_at', tostring(time),
+        'updated_at', tostring(time),
+        'expires_at', expires_at)
+
+    if acquire ~= 'non-offloadable' then
+        -- Add it to the offloadable_sessions_set.
+        redis.call('ZADD', offloadable_sessions_set, time, session_id)
     end
 
-    -- Get the current time.
-    local time = redis.call('TIME')[1]
-    -- Set the session metadata attributes.
-    redis.call('HMSET', smKey,
-            'state', 'ACTIVE',
-            'rwUses', 0,
-            'roUses', 1,
-            'clientX', clientX,
-            'clientY', clientY,
-            '_created_in', _created_in,
-            '_created_at', time,
-            '_updated_at', time,
-            '_expires_at', _expires_at)
-
-    -- Add it to the unusedSessionsSet.
-    redis.call('ZADD', usedSessionsSet, _expires_at or '+inf', sessionId)
+    if acquire ~= 'non-offloadable' and acquire ~= 'offloadable' then
+        -- Add it to the sessions_set.
+        redis.call('ZADD', sessions_set, expires_at ~= "" and expires_at or '+inf', session_id)
+    else
+        -- Add it to the sessions_set.
+        redis.call('ZADD', sessions_set, '-' .. (expires_at ~= "" and expires_at or 'inf'), session_id)
+    end
 
     -- Return true.
     return true
@@ -302,86 +215,110 @@ end)
 -- Function that create a session and set it for onload.
 redis.register_function('onload_start', function(keys, args)
     -- Keys.
-    local sessionId = keys[1]
+    local session_id = keys[1]
     -- Args.
-    local clientX = tonumber(args[1])
-    local clientY = tonumber(args[2])
-    local _created_in = args[3]
-    local _created_at = tonumber(args[4])
-    local _updated_at = tonumber(args[5])
-    local _expires_at = tonumber(args[6])
-    -- Compute the session metadata key.
-    local smKey = sessionMetadataKey(sessionId)
+    local client_lat = args[1]
+    local client_long = args[2]
+    local created_in = args[3]
+    local created_at = args[4]
+    local updated_at = args[5]
+    local expires_at = args[6]
+    -- Metadata.
+    local metadata_key = session_metadata_key(session_id)
+
+    -- Check if the session id is valid.
+    assert_valid_id(session_id)
+    -- Check if the client coordinates are valid.
+    if client_lat ~= "" or client_long ~= "" then
+        -- Check if the client coordinates are valid.
+        assert_valid_geo_coordinates(client_lat, client_long)
+    end
+    -- Check if the updated_at is valid.
+    assert_valid_timestamp_string_greater_than(created_at, 0)
+    -- Check if the updated_at is valid.
+    assert_valid_timestamp_string_greater_than(updated_at, created_at)
+    if expires_at ~= "" then
+        -- Check if the expires_at is valid.
+        assert_valid_timestamp_string_greater_than(expires_at, created_at)
+        assert_valid_timestamp_string_greater_than(expires_at, redis.call('TIME')[1])
+    end
 
     -- If session already exists, return false.
-    if redis.call('EXISTS', smKey) == 1 then
+    if redis.call('EXISTS', metadata_key) == 1 then
         return false
     end
 
     -- Set the session metadata attributes.
-    redis.call('HMSET', smKey,
-            'state', 'ONLOADING',
-            'rwUses', 0,
-            'roUses', 0,
-            'clientX', clientX,
-            'clientY', clientY,
-            '_created_in', _created_in,
-            '_created_at', _created_at,
-            '_updated_at', _updated_at,
-            '_expires_at', _expires_at)
+    redis.call('HMSET', metadata_key,
+        'state', 'ONLOADING',
+        'non_offloadable_uses', 0,
+        'offloadable_uses', 0,
+        'client_lat', client_lat,
+        'client_long', client_long,
+        'created_in', created_in,
+        'created_at', created_at,
+        'updated_at', updated_at,
+        'expires_at', expires_at)
 
-    -- Add it to the unusedSessionsSet.
-    redis.call('ZADD', usedSessionsSet, _expires_at or '+inf', sessionId)
+    -- Add it to the sessions_set.
+    redis.call('ZADD', sessions_set, '-' .. (expires_at ~= "" and expires_at or 'inf'), session_id)
 
     -- Return true.
     return true
 end)
 
--- Function that set the session data after onload.
--- TODO: This function should onload session data in batches, to avoid blocking
--- the redis instance for too long.
+-- Function that set the session data after onload. This function is separeted
+-- from onload_start to allow the client to send the data in batches.
+-- TODO: Test if this work with "composite" data types, such as geo sets that
+-- are based on zsets.
 redis.register_function('onload_data', function(keys, args)
     -- Keys.
-    local sessionId = keys[1]
+    local session_id = keys[1]
     -- Args.
     local data = cjson.decode(args[1])
+    -- Metadata.
+    local metadata_key = session_metadata_key(session_id)
     -- Get the current state.
-    local smKey = sessionMetadataKey(sessionId)
-    local state = redis.call('HMGET', smKey, 'state')
+    local state = redis.call('HGET', metadata_key, 'state')
 
     -- If session is not ONLOADING, return an error.
     if state ~= 'ONLOADING' then
         return redis.error_reply('[Ermes]: Session is not ONLOADING')
     end
 
-    local strings = data['strings']
+    -- List of key-value pairs of type string.
+    local strings = data['string']
     -- Set the session data.
     for key, value in pairs(strings) do
-        redis.call('SET', sessionDataKey(sessionId, key), value)
+        redis.call('SET', session_data_key(session_id, key), value)
     end
 
-    local lists = data['lists']
+    -- List of key-value pairs of type list.
+    local lists = data['list']
     -- Set the session data.
     for key, value in pairs(lists) do
-        redis.call('RPUSH', sessionDataKey(sessionId, key), unpack(value))
+        redis.call('RPUSH', session_data_key(session_id, key), table.unpack(value))
     end
 
-    local sets = data['sets']
+    -- List of key-value pairs of type set.
+    local sets = data['set']
     -- Set the session data.
     for key, value in pairs(sets) do
-        redis.call('SADD', sessionDataKey(sessionId, key), unpack(value))
+        redis.call('SADD', session_data_key(session_id, key), table.unpack(value))
     end
 
-    local sortedSets = data['sortedSets']
+    -- List of key-value pairs of type sorted set.
+    local sortedSets = data['zset']
     -- Set the session data.
     for key, value in pairs(sortedSets) do
-        redis.call('ZADD', sessionDataKey(sessionId, key), unpack(value))
+        redis.call('ZADD', session_data_key(session_id, key), table.unpack(value))
     end
 
-    local hashes = data['hashes']
+    -- List of key-value pairs of type hash.
+    local hashes = data['hash']
     -- Set the session data.
     for key, value in pairs(hashes) do
-        redis.call('HMSET', sessionDataKey(sessionId, key), unpack(value))
+        redis.call('HMSET', session_data_key(session_id, key), table.unpack(value))
     end
 
     -- Return OK.
@@ -391,12 +328,12 @@ end)
 -- Function that set the session as active after onload.
 redis.register_function('onload_finish', function(keys, args)
     -- Keys.
-    local sessionId = keys[1]
+    local session_id = keys[1]
+    -- Metadata.
+    local metadata_key = session_metadata_key(session_id)
     -- Get the current state.
-    local smKey = sessionMetadataKey(sessionId)
-    local state, _expires_at, _updated_at, _activity_score = redis.call('HMGET', smKey, 'state', '_expires_at', '_updated_at', '_activity_score')
-    local currentTime = redis.call('TIME')[1]
-    local _score = compute_score(smKey)
+    local result = redis.call('HMGET', metadata_key, 'state', 'expires_at', 'updated_at')
+    local state, expires_at, updated_at = result[1], result[2], result[3]
 
     -- If session is not ONLOADING, return an error.
     if state ~= 'ONLOADING' then
@@ -404,248 +341,309 @@ redis.register_function('onload_finish', function(keys, args)
     end
 
     -- Set the session metadata attributes.
-    redis.call('HMSET', smKey,
-            'state', 'ACTIVE',
-            '_activity_score', _score,
-            '_score', _score)
-
-    -- Add it to the offloadableSessionsSet.
-    redis.call('ZADD', offloadableSessionsSet, _score, sessionId)
-    -- Remove it from the unusedSessionsSet.
-    redis.call('ZREM', usedSessionsSet, sessionId)
-    -- Add it to the usedSessionsSet.
-    redis.call('ZADD', unusedSessionsSet, _expires_at or '+inf', sessionId)
+    redis.call('HMSET', metadata_key, 'state', 'ACTIVE')
+    -- Add it to the offloadable_sessions_set.
+    redis.call('ZADD', offloadable_sessions_set, updated_at, session_id)
+    -- Add it to the sessions_set.
+    redis.call('ZADD', sessions_set, expires_at ~= "" and expires_at or '+inf', session_id)
 
     -- Return OK.
     return 'OK'
 end)
 
--- Function that acquire a session in read-write mode.
-redis.register_function('rw_acquire', function(keys, args)
+-- Function that acquire a session.
+redis.register_function('acquire_session', function(keys, args)
     -- Keys.
-    local sessionId = keys[1]
+    local session_id = keys[1]
+    -- Args.
+    local allow_offloading = args[1]
+    local allow_while_offloading = args[1]
+    -- Metadata.
+    local metadata_key = session_metadata_key(session_id)
+
     -- Get the current state.
-    local smKey = sessionMetadataKey(sessionId)
+    local result = redis.call('HMGET', metadata_key, 'state', 'non_offloadable_uses', 'offloadable_uses',
+        'offloaded_to_host', 'offloaded_to_session', 'expires_at')
+    local state, non_offloadable_uses, offloadable_uses, offloaded_to_host, offloaded_to_session, expires_at =
+        result[1], result[2], result[3], result[4], result[5], result[6]
+
+    -- Parse the values.
+    non_offloadable_uses, offloadable_uses = tonumber(non_offloadable_uses), tonumber(offloadable_uses)
+    -- Get the current time.
     local time = redis.call('TIME')[1]
-    local state, rwUses, roUses, offloadedToGateway, offloadedToSession, _expires_at = redis.call('HMGET', smKey, 'state', 'rwUses', 'roUses', 'offloadedToGateway', 'offloadedToSession', '_expires_at')
 
     -- If session is OFFLOADED, return the state of the session and the offloadedTo data.
     if state == 'OFFLOADED' then
-        return {state, offloadedToGateway, offloadedToSession}
+        return { state, offloaded_to_host, offloaded_to_session }
     end
 
     -- If session is not ACTIVE or is expired, return an error.
-    if state ~= 'ACTIVE' or (_expires_at ~= nil and _expires_at < time) then
-        return redis.error_reply('[Ermes]: Session is not ACTIVE or is expired')
+    if allow_while_offloading ~= '1' and state == 'OFFLOADING' then
+        return redis.error_reply('[Ermes]: Session is offloading')
+    end
+
+    -- If session is not ACTIVE or is expired, return an error.
+    if (state ~= 'ACTIVE' and state ~= 'OFFLOADING') or (tonumber(expires_at) ~= nil and tonumber(expires_at) < time) then
+        return redis.error_reply('[Ermes]: Session is not ACTIVE, is expired or does not exist')
+    end
+
+    -- Update use based on offloadable.
+    if allow_offloading ~= '1' then
+        non_offloadable_uses = non_offloadable_uses + 1
+    else
+        offloadable_uses = offloadable_uses + 1
     end
 
     -- Set the session metadata attributes.
-    redis.call('HMSET', smKey,
-            'rwUses', rwUses + 1,
-            '_updated_at', time)
+    redis.call('HMSET', metadata_key,
+        'non_offloadable_uses', tostring(non_offloadable_uses),
+        'offloadable_uses', tostring(offloadable_uses),
+        'updated_at', tostring(time))
 
-    if rwUses == 0 then
-        -- Remove it from the offloadableSessionsSet.
-        redis.call('ZREM', offloadableSessionsSet, sessionId)
+    if non_offloadable_uses == 1 then
+        -- Remove it from the offloadable_sessions_set.
+        redis.call('ZREM', offloadable_sessions_set, session_id)
+    end
 
-        if roUses == 0 then
-            -- Remove it from the unusedSessionsSet.
-            redis.call('ZREM', unusedSessionsSet, sessionId)
-            -- Add it to the usedSessionsSet.
-            redis.call('ZADD', usedSessionsSet, _expires_at or '+inf', sessionId)
-        end
+    -- Change the score if first usage.
+    if offloadable_uses + non_offloadable_uses == 1 then
+        -- Add it to the sessions_set.
+        redis.call('ZADD', sessions_set, '-' .. (expires_at ~= "" and expires_at or 'inf'), session_id)
     end
 
     -- Return OK.
-    return {state, _expires_at}
+    return { state }
 end)
 
--- Function that acquire a session in read-only mode.
-redis.register_function('ro_acquire', function(keys, args)
+-- Function that release a previously acquired session.
+redis.register_function('release_session', function(keys, args)
     -- Keys.
-    local sessionId = keys[1]
+    local session_id = keys[1]
+    -- Args.
+    local allow_offloading = args[1]
+    -- Metadata.
+    local metadata_key = session_metadata_key(session_id)
     -- Get the current state.
-    local smKey = sessionMetadataKey(sessionId)
+    local result = redis.call('HMGET', metadata_key, 'state', 'offloaded_to_host', 'offloaded_to_session',
+        'non_offloadable_uses', 'offloadable_uses', 'updated_at', 'expires_at')
+    local state, offloaded_to_host, offloaded_to_session, non_offloadable_uses, offloadable_uses, updated_at, expires_at =
+        result[1], result[2], result[3], result[4], result[5], result[6], result[7]
+    -- Get the current time.
     local time = redis.call('TIME')[1]
-    local state, rwUses, roUses, offloadedToGateway, offloadedToSession, _expires_at = redis.call('HMGET', session, 'state', 'rwUses', 'roUses', 'offloadedToGateway', 'offloadedToSession', '_expires_at')
 
-    -- If session is OFFLOADED, return the state of the session and the offloadedTo data.
+    -- Update use based on offloadable.
+    if allow_offloading ~= '1' then
+        -- If there are no non_offloadable_uses, return an error.
+        if non_offloadable_uses == 0 then
+            return redis.error_reply('[Ermes]: No non_offloadable_uses to release')
+        end
+
+        -- Update use based on offloadable.
+        non_offloadable_uses = non_offloadable_uses - 1
+    else
+        -- If there are no offloadable_uses, return an error.
+        if offloadable_uses == 0 then
+            return redis.error_reply('[Ermes]: No offloadable_uses to release')
+        end
+
+        -- Update use based on offloadable.
+        offloadable_uses = offloadable_uses - 1
+    end
+
+
+    -- Set the session metadata attributes.
+    redis.call('HMSET', metadata_key,
+        'non_offloadable_uses', tostring(non_offloadable_uses),
+        'offloadable_uses', tostring(offloadable_uses),
+        'updated_at', tostring(time))
+
+    if non_offloadable_uses == 1 then
+        -- Add it to the offloadable_sessions_set.
+        redis.call('ZADD', offloadable_sessions_set, updated_at, session_id)
+    end
+
+    -- Change the score if last usage.
+    if offloadable_uses + non_offloadable_uses == 0 then
+        -- Add it to the sessions_set.
+        redis.call('ZADD', sessions_set, expires_at ~= "" and expires_at or '+inf', session_id)
+    end
+
+
     if state == 'OFFLOADED' then
-        return {state, offloadedToGateway, offloadedToSession}
+        return { state, offloaded_to_host, offloaded_to_session }
+    else
+        return { state }
     end
-
-    -- If session is not ACTIVE or is expired, return an error.
-    if (state ~= 'ACTIVE' and state ~= 'OFFLOADING') or (_expires_at ~= nil and _expires_at < time) then
-        return redis.error_reply('[Ermes]: Session is not ACTIVE or is expired')
-    end
-
-    -- Set the session metadata attributes.
-    redis.call('HMSET', smKey,
-            'roUses', roUses + 1,
-            '_updated_at', time)
-
-    if rwUses == 0 and roUses == 0 then
-        -- Remove it from the unusedSessionsSet.
-        redis.call('ZREM', unusedSessionsSet, sessionId)
-        -- Add it to the usedSessionsSet.
-        redis.call('ZADD', usedSessionsSet, _expires_at or '+inf', sessionId)
-    end
-
-    -- Return OK.
-    return {state, _expires_at}
-end)
-
--- Function that release a previously acquired session in read-write mode.
-redis.register_function('rw_release', function(keys, args)
-    -- Keys.
-    local sessionId = keys[1]
-    -- Get the current state.
-    local smKey = sessionMetadataKey(sessionId)
-    local time = redis.call('TIME')[1]
-    local rwUses, roUses, _expires_at = redis.call('HMGET', smKey, 'rwUses', 'roUses', '_expires_at')
-    local score = compute_score(smKey)
-
-    -- If there are no rwUses, return an error.
-    if rwUses == 0 then
-        return redis.error_reply('[Ermes]: No rwUses to release')
-    end
-
-    -- Set the session metadata attributes.
-    redis.call('HMSET', smKey,
-            'rwUses', rwUses - 1,
-            '_score', score,
-            '_updated_at', time)
-
-    if rwUses == 1 then
-        -- Add it to the offloadableSessionsSet.
-        redis.call('ZADD', offloadableSessionsSet, score, sessionId)
-
-        if roUses == 0 then
-            -- Remove it from the usedSessionsSet.
-            redis.call('ZREM', usedSessionsSet, sessionid)
-            -- Add it to the unusedSessionsSet.
-            redis.call('ZADD', unusedSessionsSet, _expires_at or '+inf', sessionId)
-        end
-    end
-
-    -- Return OK.
-    return 'OK'
-end)
-
--- Function that release a previously acquired session in read-only mode.
-redis.register_function('ro_release', function(keys, args)
-    -- Keys.
-    local sessionId = keys[1]
-    -- Get the current state.
-    local smKey = sessionMetadataKey(sessionId)
-    local time = redis.call('TIME')[1]
-    local state, rwUses, roUses, _expires_at = redis.call('HMGET', smKey, 'state', 'rwUses', 'roUses', '_expires_at')
-    local score = compute_score(smKey)
-
-    -- If there are no roUses, return an error.
-    if roUses == 0 then
-        return redis.error_reply('[Ermes]: No roUses to release')
-    end
-
-    -- Set the session metadata attributes.
-    redis.call('HMSET', smKey,
-            'roUses', roUses - 1,
-            '_score', score,
-            '_updated_at', time)
-
-    if rwUses == 0 and roUses == 1 and state ~= 'OFFLOADING' then
-        -- Remove it from the unusedSessionsSet.
-        redis.call('ZREM', usedSessionsSet, sessionId)
-        -- Add it to the usedSessionsSet.
-        redis.call('ZADD', unusedSessionsSet, _expires_at or '+inf', sessionId)
-    end
-
-    -- Return OK.
-    return 'OK'
 end)
 
 -- Function that start the offload of a session.
 redis.register_function('offload_start', function(keys, args)
     -- Keys.
-    local sessionId = keys[1]
+    local session_id = keys[1]
+    -- Metadata.
+    local metadata_key = session_metadata_key(session_id)
     -- Get the current state.
-    local smKey = sessionMetadataKey(sessionId)
-    local state, rwUses, _expires_at = redis.call('HMGET', smKey, 'state', 'rwUses', 'roUses', '_expires_at')
+    local result = redis.call('HMGET', metadata_key, 'state', 'non_offloadable_uses', 'expires_at')
+    local state, non_offloadable_uses, expires_at = result[1], result[2], result[3]
+    -- Get the current time.
     local time = redis.call('TIME')[1]
 
-    -- If session is not ACTIVE or has rwUses or is expired, return an error.
-    if state ~= 'ACTIVE' or rwUses ~= 0 or (_expires_at ~= nil and _expires_at < time) then
-        return redis.error_reply('[Ermes]: Session is not ACTIVE, has rwUses or is expired')
+    -- If session is not ACTIVE or has non_offloadable_uses or is expired, return an error.
+    if state ~= 'ACTIVE' or non_offloadable_uses ~= "0" or (expires_at ~= "" and expires_at < time) then
+        return redis.error_reply('[Ermes]: Session is not ACTIVE, has non_offloadable_uses or is expired')
     end
 
     -- Set the session metadata attributes.
-    redis.call('HMSET', smKey,
-            'state', 'OFFLOADING')
+    redis.call('HMSET', metadata_key,
+        'state', 'OFFLOADING')
 
-    -- Remove it from the offloadableSessionsSet.
-    redis.call('ZREM', offloadableSessionsSet, sessionId)
-    -- Remove it from the usedSessionsSet.
-    redis.call('ZREM', unusedSessionsSet, sessionId)
-    -- Add it to the unusedSessionsSet.
-    redis.call('ZADD', usedSessionsSet, _expires_at or '+inf', sessionId)
+    -- Remove it from the offloadable_sessions_set.
+    redis.call('ZREM', offloadable_sessions_set, session_id)
+    -- Add it to the sessions_set.
+    redis.call('ZADD', sessions_set, '-' .. (expires_at ~= "" and expires_at or 'inf'), session_id)
 
     -- Return OK.
     return 'OK'
 end)
 
 -- Function that offload the data of a session.
+-- TODO: Test if this work with "composite" data types, such as geo sets that
+-- are based on zsets.
+-- TODO: This should handle offload in chunks.
 redis.register_function('offload_data', function(keys, args)
     -- Keys.
-    local sessionId = keys[1]
+    local session_id = keys[1]
+    -- Args.
+    local cursor = args[1] == "" and "0:0" or args[1]
+    -- Metadata.
+    local metadata_key = session_metadata_key(session_id)
     -- Get the current state.
-    local smKey = sessionMetadataKey(sessionId)
-    local state, rwUses, _expires_at = redis.call('HMGET', smKey, 'state', 'rwUses', '_expires_at')
+    local state = redis.call('HGET', metadata_key, 'state')
+
+    -- Decompose the cursor.
+    local scan_cursor, type_cursor = string.match(cursor, "^(%d):(.*)$")
+    scan_cursor, type_cursor = tonumber(scan_cursor), tonumber(type_cursor)
+    if not scan_cursor or not type_cursor or type_cursor < 0 or type_cursor > 4 then
+        return redis.error_reply("Invalid cursor format")
+    end
 
     -- If session is not OFFLOADING, return an error.
     if state ~= 'OFFLOADING' then
         return redis.error_reply('[Ermes]: Session is not OFFLOADING')
     end
 
-    -- Get the session data.
+    -- TODO: We build the strcut and then we encode it, we should build it
+    -- directly in the encoded format.
     local data = {
-        strings = {},
-        lists = {},
-        sets = {},
-        sortedSets = {},
-        hashes = {}
+        string = {},
+        list = {},
+        set = {},
+        zset = {},
+        hash = {}
     }
-    
-    -- Get the session data.
-    local keys = redis.call('KEYS', sessionDataKey(sessionId, '*'))
-    for _, key in ipairs(keys) do
-        local keyType = redis.call('TYPE', key)['ok']
-        if keyType == 'string' then
-            data['strings'][key] = redis.call('GET', key)
-        elseif keyType == 'list' then
-            data['lists'][key] = redis.call('LRANGE', key, 0, -1)
-        elseif keyType == 'set' then
-            data['sets'][key] = redis.call('SMEMBERS', key)
-        elseif keyType == 'zset' then
-            data['sortedSets'][key] = redis.call('ZRANGE', key, 0, -1, 'WITHSCORES')
-        elseif keyType == 'hash' then
-            data['hashes'][key] = redis.call('HGETALL', key)
+
+    -- TODO: find a good number for count.
+    local count = 20
+    -- Pattern to match the session data keys.
+    local match_string_session_data_keys_pattern = session_data_key(session_id, '*')
+    -- Loaders by type.
+    local loaders = {
+        -- Strings.
+        function(cursor, match, count)
+            -- Get the session data of type string.
+            local result = redis.call('SCAN', cursor, 'MATCH', match, 'COUNT', count, 'TYPE', 'string')
+            local new_cursor, keys = result[1], result[2]
+            -- Set the session data.
+            for _, key in ipairs(keys) do
+                data['string'][extract_key_from_session_data_key(key)] = redis.call('GET', key)
+            end
+            -- Return the new cursor.
+            return #keys, new_cursor
+        end,
+        -- Lists.
+        function(cursor, match, count)
+            -- Get the session data of type list.
+            local result = redis.call('SCAN', cursor, 'MATCH', match, 'COUNT', count, 'TYPE', 'list')
+            local new_cursor, keys = result[1], result[2]
+            -- Set the session data.
+            for _, key in ipairs(keys) do
+                data['list'][extract_key_from_session_data_key(key)] = redis.call('LRANGE', key, 0, -1)
+            end
+            -- Return the new cursor.
+            return #keys, new_cursor
+        end,
+        -- Sets.
+        function(cursor, match, count)
+            -- Get the session data of type set.
+            local result = redis.call('SCAN', cursor, 'MATCH', match, 'COUNT', count, 'TYPE', 'set')
+            local new_cursor, keys = result[1], result[2]
+            -- Set the session data.
+            for _, key in ipairs(keys) do
+                data['set'][extract_key_from_session_data_key(key)] = redis.call('SMEMBERS', key)
+            end
+            -- Return the new cursor.
+            return #keys, new_cursor
+        end,
+        -- Sorted sets.
+        function(cursor, match, count)
+            -- Get the session data of type zset.
+            local result = redis.call('SCAN', cursor, 'MATCH', match, 'COUNT', count, 'TYPE', 'zset')
+            local new_cursor, keys = result[1], result[2]
+            -- Set the session data.
+            for _, key in ipairs(keys) do
+                data['zset'][extract_key_from_session_data_key(key)] = redis.call('ZRANGE', key, 0, -1, 'WITHSCORES')
+            end
+            -- Return the new cursor.
+            return #keys, new_cursor
+        end,
+        -- Hashes.
+        function(cursor, match, count)
+            -- Get the session data of type hash.
+            local result = redis.call('SCAN', cursor, 'MATCH', match, 'COUNT', count, 'TYPE', 'hash')
+            local new_cursor, keys = result[1], result[2]
+            -- Set the session data.
+            for _, key in ipairs(keys) do
+                data['hash'][extract_key_from_session_data_key(key)] = redis.call('HGETALL', key)
+            end
+            -- Return the new cursor.
+            return #keys, new_cursor
+        end
+    }
+
+    type_cursor = type_cursor + 1
+    local scanned
+    while count > 0 do
+        -- Get the session data of type string.
+        scanned, scan_cursor = loaders[type_cursor](scan_cursor, match_string_session_data_keys_pattern, count)
+        -- Decrease count by the number of keys fetched.
+        count = count - scanned
+        -- If cursor is 0, move to the next type.
+        if scan_cursor == '0' then
+            if type_cursor == 4 then
+                -- Return the cursor and the data.
+                break
+            end
+
+            type_cursor = type_cursor + 1
         end
     end
 
-    -- Return OK.
-    return cjson.encode(data)
+    -- Return the cursor and the data.
+    return { cursor, cjson.encode(data) }
 end)
 
 -- Function that finish the offload of a session.
 redis.register_function('offload_finish', function(keys, args)
     -- Keys.
-    local sessionId = keys[1]
+    local session_id = keys[1]
     -- Args.
-    local offloadedToGateway = args[1]
-    local offloadedToSession = args[2]
+    local offloaded_to_host = args[1]
+    local offloaded_to_session = args[2]
+    -- Metadata.
+    local metadata_key = session_metadata_key(session_id)
     -- Get the current state.
-    local smKey = sessionMetadataKey(sessionId)
-    local state, roUses, _expires_at = redis.call('HMGET', smKey, 'state', 'roUses', '_expires_at')
+    local result = redis.call('HMGET', metadata_key, 'state', 'offloadable_uses', 'expires_at')
+    local state, offloadable_uses, expires_at = result[1], result[2], result[3]
 
     -- If session is not OFFLOADING, return an error.
     if state ~= 'OFFLOADING' then
@@ -653,17 +651,14 @@ redis.register_function('offload_finish', function(keys, args)
     end
 
     -- Set the session metadata attributes.
-    redis.call('HMSET', smKey,
-            'state', 'OFFLOADED',
-            'offloadedToGateway', offloadedToGateway,
-            'offloadedToSession', offloadedToSession,
-            '_updated_at', redis.call('TIME')[1])
+    redis.call('HMSET', metadata_key,
+        'state', 'OFFLOADED',
+        'offloaded_to_host', offloaded_to_host,
+        'offloaded_to_session', offloaded_to_session)
 
-    if roUses == 0 then
-        -- Remove it from the usedSessionsSet.
-        redis.call('ZREM', usedSessionsSet, sessionId)
-        -- Add it to the unusedSessionsSet.
-        redis.call('ZADD', unusedSessionsSet, _expires_at or '+inf', sessionId)
+    if offloadable_uses == 0 then
+        -- Add it to the sessions_set.
+        redis.call('ZADD', sessions_set, expires_at ~= "" and expires_at or '+inf', session_id)
     end
 
     -- Return OK.
@@ -673,10 +668,12 @@ end)
 -- Function that cancel the offload of a session.
 redis.register_function('offload_cancel', function(keys, args)
     -- Keys.
-    local sessionId = keys[1]
+    local session_id = keys[1]
+    -- Metadata.
+    local metadata_key = session_metadata_key(session_id)
     -- Get the current state.
-    local smKey = sessionMetadataKey(sessionId)
-    local state, rwUses, _score, _expires_at = redis.call('HMGET', smKey, 'state', 'rwUses', '_score', '_expires_at')
+    local result = redis.call('HMGET', metadata_key, 'state', 'offloadable_uses', 'updated_at', 'expires_at')
+    local state, offloadable_uses, updated_at, expires_at = result[1], result[2], result[3], result[4]
 
     -- If session is not OFFLOADING, return an error.
     if state ~= 'OFFLOADING' then
@@ -684,134 +681,158 @@ redis.register_function('offload_cancel', function(keys, args)
     end
 
     -- Set the session metadata attributes.
-    redis.call('HMSET', smKey, 
-        'state', 'ACTIVE')
+    redis.call('HMSET', metadata_key, 'state', 'ACTIVE')
 
-    -- Add it to the offloadableSessionsSet.
-    redis.call('ZADD', offloadableSessionsSet, _score, sessionId)
+    -- Add it to the offloadable_sessions_set.
+    redis.call('ZADD', offloadable_sessions_set, updated_at, session_id)
 
-    if rwUses == 0 then
-        -- Remove it from the usedSessionsSet.
-        redis.call('ZREM', usedSessionsSet, sessionId)
-        -- Add it to the unusedSessionsSet.
-        redis.call('ZADD', unusedSessionsSet, _expires_at or '+inf', sessionId)
+    if offloadable_uses == 0 then
+        -- Add it to the sessions_set.
+        redis.call('ZADD', sessions_set, expires_at ~= "" and expires_at or '+inf', session_id)
     end
 
     -- Return OK.
     return 'OK'
 end)
 
--- Function that delete a session. It first delete "count" keys from the session data, then, if there are more keys to
--- delete, it returns 1, otherwise it deletes also the session metadata.
-redis.register_function('delete_chunk', function(keys, args)
-    -- Keys.
-    local sessionId = keys[1]
-    -- Delete the session.
-    return delete_session_chunk(sessionId)
-end)
-
 -- Function that set the expiration time of a session.
 redis.register_function('set_expire_time', function(keys, args)
     -- Keys.
-    local sessionId = keys[1]
+    local session_id = keys[1]
     -- Args.
-    local _expires_at = args[1]
+    local expires_at = args[1]
     -- Set the expire time.
-    return set_expire_time(sessionId, _expires_at)
-end)
+    local metadata_key = session_metadata_key(session_id)
 
--- Function that set the session as expired.
-redis.register_function('expire', function(keys, args)
-    -- Keys.
-    local sessionId = keys[1]
-    -- Set the expire time to now.
-    return set_expire_time(sessionId, redis.call('TIME')[1])
-end)
+    if expires_at ~= "" then
+        -- Check if the expires_at is valid.
+        assert_valid_timestamp_string_greater_than(expires_at, redis.call('TIME')[1])
+    end
 
--- Function that set the coordinates of the client of a session.
-redis.register_function('set_client_coordinates', function(keys, args)
-    -- Keys.
-    local session = sessionMetadataKey(keys[1])
-    -- Args.
-    local clientX = args[1]
-    local clientY = args[2]
+    -- Set the session metadata attributes.
+    redis.call('HMSET', metadata_key,
+        'expires_at', expires_at,
+        'updated_at', redis.call('TIME')[1])
 
-    redis.call('HMSET', session,
-            'clientX', clientX,
-            'clientY', clientY,
-            '_score', _score,
-            '_updated_at', redis.call('TIME')[1])
+    -- Check if the session is being used or not.
+    local result = redis.call('HMGET', metadata_key, 'offloadable_uses', 'non_offloadable_uses')
+    local offloadable_uses, non_offloadable_uses = result[1], result[2]
 
-    -- Compute the score of the session.
-    local _score = compute_score(session)
-
-    -- Update the score of the session.
-    redis.call('ZADD', offloadableSessionsSet, _score, session)
+    if non_offloadable_uses == 0 and offloadable_uses == 0 then
+        -- Add it to the sessions_set.
+        redis.call('ZADD', sessions_set, expires_at ~= "" and expires_at or '+inf', session_id)
+    else
+        -- Add it to the sessions_set.
+        redis.call('ZADD', sessions_set, '-' .. (expires_at ~= "" and expires_at or 'inf'), session_id)
+    end
 
     -- Return OK.
     return 'OK'
 end)
 
+-- Function that set the coordinates of the client of a session.
+redis.register_function('set_client_coordinates', function(keys, args)
+    -- Keys.
+    local session = session_metadata_key(keys[1])
+    -- Args.
+    local client_lat = args[1]
+    local client_long = args[2]
+
+    if client_lat ~= "" or client_long ~= "" then
+        -- Check if the client coordinates are valid.
+        assert_valid_geo_coordinates(client_lat, client_long)
+    end
+
+    -- Set the session metadata attributes.
+    redis.call('HMSET', session,
+        'client_lat', client_lat,
+        'client_long', client_long,
+        'updated_at', redis.call('TIME')[1])
+
+    -- Return OK.
+    return 'OK'
+end)
+
+local function delete_session_chunk(session_id, count)
+    -- Metadata.
+    local metadata_key = session_metadata_key(session_id)
+    -- Get the current state.
+    local result = redis.call('HMGET', metadata_key, 'state', 'non_offloadable_uses', 'offloadable_uses')
+    local state, non_offloadable_uses, offloadable_uses = result[1], result[2], result[3]
+
+    -- If session is not deletable, return an error.
+    if non_offloadable_uses ~= "0" or offloadable_uses ~= "0" or state == 'OFFLOADING' or state == 'ONLOADING' then
+        return redis.error_reply('[Ermes]: Session is not deletable')
+    end
+
+    -- TODO: Find the best default value for count. Note that we unpack the
+    -- result of the scan for performance reasons, and that limits the maximum
+    -- value of count.
+    count = count or 100
+    -- Delete "count" keys that starts with session from the session data.
+    local match = session_data_key(session_id, '*')
+    local result = redis.call('SCAN', 0, 'MATCH', match, 'COUNT', count)
+    -- Unlink the keys.
+    -- FIXME: This is a blocking operation, we should unlink the keys in
+    -- batches.
+    redis.call('UNLINK', table.unpack(result[2]))
+
+    -- If there are no more keys to delete, delete the session metadata.
+    if result[1] == '0' then
+        -- Delete the session metadata.
+        redis.call('DEL', metadata_key)
+        -- Remove it from the offloadable_sessions_set.
+        redis.call('ZREM', offloadable_sessions_set, session_id)
+        -- Remove it from the sessions_set.
+        redis.call('ZREM', sessions_set, session_id)
+        -- Return 0 and the number of deleted keys.
+        return { #result[2], 0 }
+    end
+
+    -- Otherwise, return 1 and the number of deleted keys (Note that scan may
+    -- return more keys than count).
+    return { #result[2], 1 }
+end
+
+-- Function that delete a session. It first delete "count" keys from the session data, then, if there are more keys to
+-- delete, it returns 1, otherwise it deletes also the session metadata.
+redis.register_function('delete_chunk', function(keys, args)
+    -- Keys.
+    local session_id = keys[1]
+    -- Delete the session.
+    return delete_session_chunk(session_id, 100)
+end)
+
 -- Function that delete all the sessions that are not used and are expired.
-redis.register_function('collect_expired', function(keys, args)
+redis.register_function('garbage_collect', function(keys, args)
+    -- Args.
+    local ttlAfterExpiration = args[1]
     -- Count the deleted sessions.
     local deleted = 0
     local count = 100
     -- Remove count sessions data keys.
-    repeat 
-        -- Retrieve one expired sessions to delete from the unusedSessionsSet.
-        local expiredSession = redis.call('ZRANGEBYSCORE', unusedSessionsSet, '-inf', redis.call('TIME')[1], 'LIMIT', 0, 1)
+    repeat
+        -- Retrieve one expired sessions to delete from the sessions_set.
+        local expiredSession = redis.call('ZRANGEBYSCORE', sessions_set, '0', redis.call('TIME')[1], 'LIMIT', 0, 1)
         -- If there are no more expired sessions, return.
         if #expiredSession == 0 then
-            return {0, deleted}
-        end
+            expiredSession = redis.call('ZRANGEBYSCORE', sessions_set, '-inf',
+                redis.call('TIME')[1] - tonumber(ttlAfterExpiration), 'LIMIT', 0, 1)
 
-        if deleted >= count then
-            return {1, deleted}
-        end
-
-        -- Delete the session.
-        local flag, deletedKeys
-        repeat
-            -- Delete the session.
-            flag, deletedKeys = delete_session_chunk(expiredSession[1])
-
-            -- If there is an error, return it.
-            if type(flag) == 'table' then
-                return flag
+            if #expiredSession == 0 then
+                return { 0, deleted }
             end
-
-            -- Increment deleted.
-            deleted = deleted + deletedKeys
-        until flag == 0 or deleted >= count
-
-    until true
-end)
-
--- Function that delete all the sessions that are not used and are expired.
-redis.register_function('collect_expired_but_never_released', function(keys, args)
-    -- Args.
-    local ttlAfterExpiration = args[1]
-    local deleted = 0
-    local count = 100
-    -- Remove count sessions data keys.
-    repeat 
-        -- Retrieve one expired sessions to delete from the usedSessionsSet.
-        local expiredSession = redis.call('ZRANGEBYSCORE', usedSessionsSet, '-inf', redis.call('TIME')[1] - ttlAfterExpiration, 'LIMIT', 0, 1)
-        -- If there are no more expired sessions, return.
-        if #expiredSession == 0 then
-            return count
         end
 
         if deleted >= count then
-            return deleted
+            return { 1, deleted }
         end
 
         -- Delete the session.
         local flag, deletedKeys
         repeat
             -- Delete the session.
-            flag, deletedKeys = delete_session_chunk(expiredSession[1])
+            deletedKeys, flag = delete_session_chunk(expiredSession[1])
 
             -- If there is an error, return it.
             if type(flag) == 'table' then
