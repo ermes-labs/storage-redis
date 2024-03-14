@@ -1,0 +1,38 @@
+{
+  "name": "@ermes-labs/redis",
+  "version": "0.0.1",
+  "description": "",
+  "homepage": "https://ermes-labs.github.io/docs",
+  "type": "module",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "typings": "dist/index.d.ts",
+  "sideEffects": false,
+  "scripts": {
+    "format": "biome format src/** --write",
+    "lint": "biome lint src/**",
+    "check": "biome check --apply --verbose src/** *.*",
+    "check-ci": "biome ci src/** *.*",
+    "build": "bun run build:js && bun run build:types",
+    "build:js": "bun run ./bun.build.ts",
+    "build:types": "tsc --declaration --emitDeclarationOnly --outDir ./dist ./src/index.ts",
+    "test": "bun run test",
+    "coverage": "bun run test --coverage"
+  },
+  "keywords": [
+    "ermes"
+  ],
+  "author": {
+    "name": "Paolo Longo",
+    "email": "paololongo.git@gmail.com",
+    "url": "https://github.com/paol-imi"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@biomejs/biome": "1.5.3",
+    "@ermes-labs/api": "^0.0.1",
+    "@types/bun": "^1.0.8",
+    "typescript": "^5.3.3"
+  }
+}
