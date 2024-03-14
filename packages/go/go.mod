@@ -1,6 +1,6 @@
 module github.com/ermes-labs/storage-redis/packages/go
 
-go 1.21.4
+go 1.22.0
 
 require github.com/redis/go-redis/v9 v9.5.1
 
