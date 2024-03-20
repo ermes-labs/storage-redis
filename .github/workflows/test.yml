@@ -37,10 +37,13 @@ jobs:
         working-directory: ./test
         run: go get .
 
+      - name: Wait for Redis to be ready
+        run: sleep 3
+
       - name: Test with the Go CLI and run coverage
         working-directory: ./test
         run: go test ./... -coverprofile=coverage.out -covermode=atomic
-        
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3
         with:
