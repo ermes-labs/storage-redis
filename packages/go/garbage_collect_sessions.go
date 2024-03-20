@@ -11,7 +11,7 @@ import (
 // collection from the last cursor, nil to start from the beginning. The
 // function returns the next cursor to continue the garbage collection, or
 // nil if the garbage collection is completed.
-func (rc *RedisCommands) GarbageCollectSessions(
+func (c *RedisCommands) GarbageCollectSessions(
 	ctx context.Context,
 	opt api.GarbageCollectSessionsOptions,
 	cursor *string,

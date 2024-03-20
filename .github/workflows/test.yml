@@ -11,10 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        go-version: ["1.21.x"]
+        go-version: ["1.22.x"]
     defaults:
       run:
-        working-directory: packages/go
+        working-directory: test
 
     steps:
       - uses: actions/checkout@v4
@@ -34,7 +34,6 @@ jobs:
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3
         with:
-          files: ./packages/go/coverage.out
-          flags: binding-go
+          files: ./test/coverage.out
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

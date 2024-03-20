@@ -53,7 +53,7 @@ func (c *RedisCommands) OffloadSession(
 // Confirms the offload of a session.
 // errors:
 // - ErrSessionNotFound: If no session with the given id is found.
-func (rc *RedisCommands) ConfirmSessionOffload(
+func (c *RedisCommands) ConfirmSessionOffload(
 	ctx context.Context,
 	id string,
 	newLocation api.SessionLocation,
@@ -61,7 +61,7 @@ func (rc *RedisCommands) ConfirmSessionOffload(
 	// TODO: extract into another API?
 	notifyLastVisitedNode func(context.Context, api.SessionLocation) (bool, error),
 ) (err error) {
-	return nil
+	return c.client.FCall(ctx, "offload_finish", []string{id}, newLocation.Host, newLocation.SessionId).Err()
 }
 
 // Updates the location of an offloaded session, the function returns true if
@@ -71,7 +71,7 @@ func (rc *RedisCommands) ConfirmSessionOffload(
 // errors:
 // - ErrSessionNotFound: If no session with the given id is found.
 // - ErrSessionIsNotOffloaded: If the session is not offloaded.
-func (rc *RedisCommands) UpdateOffloadedSessionLocation(
+func (c *RedisCommands) UpdateOffloadedSessionLocation(
 	ctx context.Context,
 	id string,
 	newLocation api.SessionLocation,
@@ -85,10 +85,20 @@ func (rc *RedisCommands) UpdateOffloadedSessionLocation(
 // errors:
 // - ErrInvalidCursor: If the cursor is invalid.
 // - ErrInvalidCount: If the count is invalid.
-func (rc *RedisCommands) ScanOffloadedSessions(
+func (c *RedisCommands) ScanOffloadedSessions(
 	ctx context.Context,
 	cursor uint64,
 	count int64,
 ) (ids []string, newCursor uint64, err error) {
-	return []string{}, 0, nil
+	results, newCursor, err := c.client.ZScan(ctx, "c:offloaded_sessions_set", cursor, "*", count).Result()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	keys := make([]string, 0, len(results)/2)
+	for i := 0; i < len(results); i += 2 {
+		keys = append(keys, results[i])
+	}
+
+	return keys, newCursor, nil
 }

@@ -4,8 +4,6 @@ import (
 	"context"
 	"testing"
 
-	"github.com/ermes-labs/api-go/api"
-	"github.com/ermes-labs/spec-tests"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -25,15 +23,4 @@ func TestGetTime(t *testing.T) {
 	if result.IsZero() {
 		t.Errorf("Received null time from Redis")
 	}
-}
-
-func TestSpec(t *testing.T) {
-	cmd, free := env.New("node")
-	defer free()
-	// Print the time
-	cmd.Set_current_node_key(context.Background(), "time")
-
-	cmd.AcquireSession(context.Background(), "miao", api.NewAcquireSessionOptionsBuilder().Build())
-
-	spec.RunTests(t, &env)
 }

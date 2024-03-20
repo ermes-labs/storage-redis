@@ -54,9 +54,22 @@ The full state machine is described here:
             (_  , 1-N) release-offloadable -> ACTIVE    (_  , $--)}.
 --]]
 
+
 -- Generate a key in the infrastructure keyspace.
 local function infrastructure_key(key)
-    return 'i:' .. key
+    if type(key) ~= 'string' then
+        error('[Ermes]: Key must be a string, got ' .. type(key))
+    end
+
+    return 'i:node:' .. key
+end
+-- Generate a key in the infrastructure keyspace for the relations.
+local function infrastructure_children_key(key)
+    return 'i:children:' .. key
+end
+-- Generate a key in the infrastructure keyspace for the relations.
+local function infrastructure_parent_key(key)
+    return 'i:parent:' .. key
 end
 -- Generate a key in the config keyspace.
 local function config_key(key)
@@ -98,6 +111,8 @@ end
 local sessions_set = config_key('sessions_set')
 -- Ordered set by score of the sessions that can be offloaded.
 local offloadable_sessions_set = config_key('offloadable_sessions_set')
+-- Ordered set by score of the sessions that are offloaded.
+local offloaded_sessions_set = config_key('offloaded_sessions_set')
 -- Geo set of the nodes.
 local nodes_geoset = config_key('nodes_geoset')
 -- Key mapped to the id of the current node.
@@ -113,7 +128,7 @@ redis.register_function('set_current_node_key', function(keys, args)
     -- Keys.
     local node_id = keys[1]
     -- Set the current node key.
-    current_node_key = config_key(node_id)
+    current_node_key = node_id
     -- Return OK.
     return 'OK'
 end)
@@ -140,7 +155,7 @@ local function assert_valid_geo_coordinates(lat, long)
     local lat, long = tonumber(lat), tonumber(long)
     -- Check if lat and long are valid.
     if lat == nil or long == nil or lat < -90 or lat > 90 or long < -180 or long > 180 then
-        error('[Ermes]: Geo coordinates are not valid')
+        error('[Ermes]: Geo coordinates are not valid' .. lat .. " " .. long)
     end
 end
 
@@ -148,7 +163,8 @@ end
 -- error.
 local function assert_valid_timestamp_string_greater_than(string_timestamp, any)
     if tonumber(string_timestamp) == nil or tonumber(string_timestamp) < (tonumber(any) or 0) then
-        error('[Ermes]: Unix timestamp is not valid')
+        error('[Ermes]: Unix timestamp is not valid, must be greater than ' ..
+            (tonumber(any) or 0) .. ' got ' .. string_timestamp)
     end
 end
 
@@ -160,8 +176,8 @@ redis.register_function('create_session', function(keys, args)
     -- Args.
     local client_lat = args[1]
     local client_long = args[2]
-    local expires_at = args[2]
-    local acquire = args[3] -- "offloadable", "non-offloadable", ""
+    local expires_at = args[3]
+    local acquire = args[4] -- "offloadable", "non-offloadable", ""
     -- Metadata.
     local metadata_key = session_metadata_key(session_id)
     -- Get the current time.
@@ -346,6 +362,8 @@ redis.register_function('onload_finish', function(keys, args)
     redis.call('ZADD', offloadable_sessions_set, updated_at, session_id)
     -- Add it to the sessions_set.
     redis.call('ZADD', sessions_set, expires_at ~= "" and expires_at or '+inf', session_id)
+
+    redis.call('ZREM', offloaded_sessions_set, session_id)
 
     -- Return OK.
     return 'OK'
@@ -661,6 +679,8 @@ redis.register_function('offload_finish', function(keys, args)
         redis.call('ZADD', sessions_set, expires_at ~= "" and expires_at or '+inf', session_id)
     end
 
+    redis.call('ZADD', offloaded_sessions_set, expires_at ~= "" and expires_at or '+inf', session_id)
+
     -- Return OK.
     return 'OK'
 end)
@@ -843,4 +863,119 @@ redis.register_function('garbage_collect', function(keys, args)
             deleted = deleted + deletedKeys
         until flag == 0 or deleted >= count
     until true
+end)
+
+-- Function that create a node and register it.
+redis.register_function('register_node', function(keys, args)
+    -- Keys.
+    local node_id = keys[1]
+    -- Args.
+    local jsonNode = args[1]
+    local node = cjson.decode(jsonNode)
+    local coords = node['geoCoordinates']
+
+    -- Check if the node id is valid.
+    assert_valid_id(node_id)
+    -- Check if the node coordinates are valid.
+    assert_valid_geo_coordinates(coords['latitude'], coords['longitude'])
+
+    -- Add the node to the nodes_geoset.
+    redis.call('GEOADD', nodes_geoset, tostring(coords['longitude'] + 0.0), tostring(coords['latitude'] + 0.0), node_id)
+
+    -- Set the json at node_id.
+    redis.call('SET', infrastructure_key(node_id), jsonNode)
+    -- Return OK.
+    return 'OK'
+end)
+
+-- Function that create a node and register it.
+redis.register_function('register_node_relation', function(keys, args)
+    -- Keys.
+    local parent_node_id = keys[1]
+    local child_node_id = keys[2]
+
+    -- Set the parent-child relations.
+    redis.call('SET', infrastructure_parent_key(child_node_id), parent_node_id)
+    redis.call('SADD', infrastructure_children_key(parent_node_id), child_node_id)
+
+    -- Return OK.
+    return 'OK'
+end)
+
+-- Function that get the node by id.
+redis.register_function('get_parent_node_of', function(keys, args)
+    -- Keys.
+    local node_id = keys[1]
+
+    -- Get the parent.
+    local parent = redis.call('GET', infrastructure_parent_key(node_id))
+
+    -- If parent is nil, return nil.
+    if parent == nil or parent == "" or parent == false then
+        return ""
+    end
+
+    return redis.call('GET', infrastructure_key(parent))
+end)
+
+-- Function that get the node by id.
+redis.register_function('get_children_nodes_of', function(keys, args)
+    -- Keys.
+    local node_id = keys[1]
+
+    -- Get the children.
+    local children = redis.call('SMEMBERS', infrastructure_children_key(node_id))
+
+    if children == nil then
+        return {}
+    end
+
+    -- Get the json of the children.
+    local ArrayOfJsons = {}
+
+    for _, child in ipairs(children) do
+        table.insert(ArrayOfJsons, redis.call('GET', infrastructure_key(child)))
+    end
+
+    -- Return the json.
+    return ArrayOfJsons
+end)
+
+redis.register_function('find_lookup_node', function(keys, args)
+    -- Keys.
+    local session_id = keys[1]
+
+    -- Retrieve client location and created_in node.
+    local metadata_key = session_metadata_key(session_id)
+    local result = redis.call('HMGET', metadata_key, 'client_lat', 'client_long', 'created_in')
+    local client_lat, client_long, created_in = result[1], result[2], result[3]
+
+    -- If client location is not set, approximate them with the created_in node.
+    if client_lat == "" or client_long == "" then
+        -- If the created_in node has children, return it.
+        local children = redis.call('SMEMBERS', infrastructure_children_key(created_in))
+
+        if #children > 0 then
+            return redis.call('GET', infrastructure_key(created_in))
+        end
+
+        -- Get the geo coords from the geo set.
+        local coords = redis.call('GEOPOS', nodes_geoset, created_in)
+        client_lat, client_long = coords[1][1], coords[1][2]
+    end
+
+    -- Get the closest node.
+    local closest = redis.call('GEOSEARCH', nodes_geoset, 'FROMLONLAT', client_long, client_lat, 'BYRADIUS', '1000000',
+        'KM',
+        'ASC', 'COUNT', '20', 'WITHDIST')
+
+    -- Loop until a node with children is found and return it.
+    for _, node in ipairs(closest) do
+        local children = redis.call('SMEMBERS', infrastructure_children_key(node[1]))
+        if #children > 0 then
+            return redis.call('GET', infrastructure_key(node[1]))
+        end
+    end
+
+    return redis.error_reply('No node found')
 end)
