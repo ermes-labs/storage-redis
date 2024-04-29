@@ -21,7 +21,7 @@ type ErmesKeySpaces struct {
 }
 
 // Create a PublicErmesKeySpaces struct.
-func NewPublicErmesKeySpace(sessionId string) PublicErmesKeySpaces {
+func NewPublicErmesKeySpaces(sessionId string) PublicErmesKeySpaces {
 	if len(sessionId) != 36 {
 		panic("session id must be 36 characters long")
 	}
@@ -41,7 +41,7 @@ func NewPublicErmesKeySpaceWithoutSessionSpecificKeySpaces() PublicErmesKeySpace
 }
 
 // Create a InternalErmesKeySpaces struct.
-func NewInternalErmesKeySpace(sessionId string) InternalErmesKeySpaces {
+func NewInternalErmesKeySpaces(sessionId string) InternalErmesKeySpaces {
 	if len(sessionId) != 36 {
 		panic("session id must be 36 characters long")
 	}
@@ -67,8 +67,8 @@ func NewErmesKeySpaces(sessionId string) ErmesKeySpaces {
 	}
 
 	return ErmesKeySpaces{
-		PublicErmesKeySpaces:   NewPublicErmesKeySpace(sessionId),
-		InternalErmesKeySpaces: NewInternalErmesKeySpace(sessionId),
+		PublicErmesKeySpaces:   NewPublicErmesKeySpaces(sessionId),
+		InternalErmesKeySpaces: NewInternalErmesKeySpaces(sessionId),
 	}
 }
 

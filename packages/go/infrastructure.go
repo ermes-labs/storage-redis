@@ -88,31 +88,6 @@ func (c *RedisCommands) GetChildrenNodesOf(
 	return nodes, nil
 }
 
-// Get the lookup node for a session offloading.
-func (c *RedisCommands) FindLookupNode(
-	ctx context.Context,
-	sessionId string,
-) (infrastructure.Node, error) {
-	nodeJson, err := c.client.FCall(ctx, "find_lookup_node", []string{sessionId}).Text()
-
-	if err != nil {
-		return infrastructure.Node{}, err
-	}
-
-	if nodeJson == "" {
-		return infrastructure.Node{}, nil
-	}
-
-	node, err := infrastructure.UnmarshalNode([]byte(nodeJson))
-
-	if err != nil {
-		return infrastructure.Node{}, err
-	}
-
-	return *node, nil
-
-}
-
 // Get the resources usage of a session.
 // errors:
 // - ErrSessionNotFound: If no session with the given id is found.
@@ -146,8 +121,8 @@ func (c *RedisCommands) UpdateSessionResourcesUsage(
 // Get the update to send to the parent node.
 func (c *RedisCommands) ResourcesUsageUpdateToParent(
 	ctx context.Context,
-) (host string, sessions uint, resourcesUsageNodesMap map[string]api.ResourcesUsage, err error) {
-	return "", 0, nil, nil
+) (node infrastructure.Node, sessions uint, resourcesUsageNodesMap map[string]api.ResourcesUsage, err error) {
+	return infrastructure.Node{}, 0, nil, nil
 }
 
 // Get the update from the child nodes.
