@@ -14,7 +14,7 @@ jobs:
     steps:
       - name: Extract version
         run: |
-          echo "VERSION=$(echo ${{ github.ref }} | sed 's/api-v//')" >> $GITHUB_ENV
+          echo "VERSION=$(echo ${{ github.ref }} | sed 's//refs\/tags\/api-v//')" >> $GITHUB_ENV
 
       - name: Checkout
         uses: actions/checkout@v3
